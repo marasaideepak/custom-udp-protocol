@@ -1,0 +1,19 @@
+CFLAGS = -Wall -g -pthread
+LIBS = -L./ -lksocket
+
+all: user1 user2
+
+user1: user1.o
+	gcc $(CFLAGS) -o user1 user1.o $(LIBS)
+
+user2: user2.o
+	gcc $(CFLAGS) -o user2 user2.o $(LIBS)
+
+user1.o: user1.c ksocket.h
+	gcc $(CFLAGS) -c user1.c
+
+user2.o: user2.c ksocket.h
+	gcc $(CFLAGS) -c user2.c
+
+clean:
+	rm -f user1 user2 *.o

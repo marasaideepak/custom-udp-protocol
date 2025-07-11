@@ -1,0 +1,163 @@
+   
+----------------        Performance results with different drop probabilities ( 100KB file )     ----------------------------
+
+|----------------------|-----------------------------------|----------------|---------------------|            
+| Drop Probability (p) | Average Transmissions per Message | Total Messages | Total Transmissions |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.05                 | 1.2376                            | 202            | 250                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.10                 | 1.3861                            | 202            | 280                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.15                 | 1.4851                            | 202            | 300                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.20                 | 1.6633                            | 202            | 336                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.25                 | 1.7722                            | 202            | 358                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.30                 | 2.1881                            | 202            | 442                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.35                 | 2.5247                            | 202            | 455                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.40                 | 2.5990                            | 202            | 525                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.45                 | 2.7425                            | 202            | 554                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+| 0.50                 | 3.5495                            | 202            | 717                 |
+|----------------------|-----------------------------------|----------------|---------------------|
+
+The average number of transmissions required per message increases with a nearly 3x increase at p = 0.50 compared to p = 0.05.
+
+-----------------------------------     DATA STRUCTURES     -----------------------------------------------
+
+                                          ksocket.h
+
+1. Window Structure (struct wnd):
+   This structure implements the sliding window mechanism.
+   - wndw[256]: an array that maps sequence numbers to recv buffer index ( for reciever ) 
+                and flags the seq numbers that are yet to acknowledged ( for sender)
+   - size: current size of the window
+   - start_seq: starting sequence number of the window (acts as left pointer to window)
+
+2. Shared Memory Structure (struct shared_mem):
+   Sahred memoty that stores the state of each socket connection.
+   - Socket status:
+     - available: flag indicating if the socket is available 
+     - process_id: PID of the process using this socket
+     - sock_id: underlying UDP socket id
+   
+   - Connection information:
+     - ip_addr: destination ip address
+     - port: destination port number
+   
+   - Send buffer :
+     - send_buf[10][512]: sender side buffer(window size 10 and each msg is of 512 bytes)
+     - send_buf_size: current available space in send buffer
+     - send_msg_len[10]: length of each msg in the send buffer
+   
+   - Receive buffer :
+     - recv_buf[10][512]: reciever side buffer(window size 10 and each msg is of 512 bytes)
+     - recv_next_idx: index of the next message to be read by the application(in our case just write it in output file)
+     - is_unique[10]: flag indicating if message at index is new and ready to read and not a duplicate
+     - recv_msg_len[10]: length of each message in the receive buffer
+   
+   - Windows :
+     - swnd: Sending window
+     - rwnd: Receiving window
+
+   - Others :
+     - nospace: flag indicating no space in rwnd
+     - last_sent[256]: timestamp when each sequence number was last transmitted to help with retransmissions
+
+3. KTP Header (struct ktp_header):
+   - type: message type (0 for DATA, 1 for ACK)
+   - seq_num: 8-bit sequence number
+   - wnd_size: receiver window size ( used for ack type )
+   - len: Length of the message payload ( used for data type )
+
+4. Socket Information (struct socket_info):
+   Shared memory structure for passing socket creation/binding information from initsocket to ksocket & vice-versa
+   - sock_id: socket id
+   - ip_addr: ip address for binding
+   - port: port number for binding
+   - err_no: errno 
+
+-----------------------------------     FUNCTIONS     -----------------------------------------------
+
+                                        ksocket.c
+
+1. dropMessage(float prob)
+   - Purpose: Simulates packet loss with probability prob
+   - Generates a random number and compares it with the threshold
+
+2. clear_socket_info()
+   - Purpose: Helper function to reset the socket_info shared memory
+   - Sets all fields to default values
+
+3. init_()
+   - Purpose: Initializes shared memory and semaphores
+   - Attaches to shared memory segments and semaphores created by initksocket 
+
+4. k_socket(int domain, int type, int protocol)
+   - Purpose: Creates a KTP socket
+    - Finds an available slot in the shared memory
+    - Signals initksocket to create a UDP socket
+    - Initializes the shared memory for the corresponding socket
+
+5. k_bind(int sockfd, char* src_ip, int src_port, char* dest_ip, int dest_port)
+   - Purpose: Binds a socket to source and destination addresses
+    - Signals initksocket to bind the UDP socket to source IP/port
+    - Stores destination IP/port in shared memory
+
+6. k_sendto(int sockfd, const void *buf, int len, const struct sockaddr *dest_addr, socklen_t addrlen)
+   - Purpose: Sends data through a KTP socket
+    - Checks if destination matches the bound address, if not returns ENOTBOUND error
+    - Finds available sequence number and buffer slot
+    - If no space returns ENOSPACE error
+    - Else copies message to send buffer
+
+7. k_recvfrom(int sockfd, void *buf, int len, struct sockaddr *src_addr, socklen_t *addrlen)
+   - Purpose: Receives data from a KTP socket
+    - Checks if there's a new message at the current receive index
+    - Copies message data to user buffer
+    - Updates receive window info for that seq number
+
+8. k_close(int sockfd)
+   - Purpose: Closes a KTP socket
+   - Marks the socket as available and closes the underlying UDP socket
+
+
+                                 initksocket.c
+
+1. handle_SIGINT(int sig)
+   - Purpose: Handles the interrupt signal (Ctrl+C)
+   - Cleans up shared memory and semaphores before exiting
+
+2. curr_time()
+   - Purpose: Helper function to get the current formatted time ( for debugging or to know the curr status in initksocket)
+
+3. R() - receiver Thread
+   - Purpose: Handles receiving packets from all sockets
+      - Uses select() to monitor multiple sockets with timeout
+      - Processes incoming DATA and ACK messages
+      - Manages rwnd and sends ACKs
+      - Handles in-order and out-of-order messages
+      - Periodically sends window updates when buffer is full
+
+4. S() - sender Thread
+   - Purpose: Handles sending packets and retransmissions
+      - Periodically checks for timeouts on unacknowledged messages
+      - Retransmits all unacknowledged messages on timeout
+      - Sends new messages that haven't been transmitted yet
+
+5. G() - Garbage Collector Thread
+   - Purpose: Cleans up resources for terminated processes
+      - Periodically checks if processes using sockets are still alive( by checking the pid status )
+      - Frees socket resources for terminated processes
+      - Prints statistics when a process terminates
+
+6. main()
+   - Purpose: Initializes the KTP system
+      - Creates shared memory segments and semaphores
+      - Initializes socket management structures
+      - Starts R, S, and G threads
+      - Handles socket creation and binding requests
